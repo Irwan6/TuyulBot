@@ -76,6 +76,10 @@ export class Engine {
   private closedAt: number | null = null;
   private closeRetryAt: Partial<Record<BeeId, number>> = {};
   private closeAnnounced = false;
+  /** True on a venue with a signed executor (OKX, Hyperliquid): reconcile and poll funding instead of simulating. */
+  private get signed(): boolean {
+    return this.d.exec.kind !== "sim";
+  }
 
   constructor(private d: EngineDeps) {
     this.now = d.now ?? Date.now;
@@ -112,7 +116,7 @@ export class Engine {
     }
 
     await this.refreshMarket();
-    if (this.d.exec.kind === "okx") await this.reconcile();
+    if (this.signed) await this.reconcile();
 
     this.d.bus.emit("status", { event: "engine_start", mode: cfg.mode, tickMs: cfg.tickMs });
     this.d.alerts.send(`engine started (MODE=${cfg.mode})`);
@@ -149,7 +153,7 @@ export class Engine {
     try {
       await this.d.feed.refresh(this.now());
       this.rankBoozyHourly();
-      if (this.d.exec.kind === "okx") await this.pollFunding();
+      if (this.signed) await this.pollFunding();
     } catch (err) {
       log.warn("market refresh failed", { err: safeError(err) });
     } finally {
@@ -186,7 +190,7 @@ export class Engine {
         }
       }
       this.d.bus.emit("equity", { bees: BEES.map((id) => this.publicBee(id)) }, now);
-      if (this.d.exec.kind === "okx" && now - this.lastReconAt >= RECON_MS) await this.reconcile();
+      if (this.signed && now - this.lastReconAt >= RECON_MS) await this.reconcile();
       this.checkJevOutage(now);
     } finally {
       this.ticking = false;
@@ -269,7 +273,7 @@ export class Engine {
       jev: jevStatus,
       sizeMult: this.sizeMult(now),
       dataAgeMs: now - this.d.feed.lastRefreshAt,
-      maxDataAgeMs: 3 * cfg.dataRefreshMs + 30_000,
+      maxDataAgeMs: this.maxDataAge(cfg),
     });
 
     if (risk.capTripped) {
@@ -358,7 +362,7 @@ export class Engine {
       jev: "no_options",
       sizeMult: this.sizeMult(now),
       dataAgeMs: now - this.d.feed.lastRefreshAt,
-      maxDataAgeMs: 3 * this.d.cfg.dataRefreshMs + 30_000,
+      maxDataAgeMs: this.maxDataAge(this.d.cfg),
     });
     if (risk.capTripped) {
       db.insertCap(id, now, risk.capTripped, risk.status);
@@ -583,6 +587,19 @@ export class Engine {
   }
 
   // ---------- funding, reconciliation, ranks ----------
+
+  /**
+   * How old market data may be before the risk layer refuses to act on it.
+   *
+   * A venue that charges a per-minute weight budget (Hyperliquid) needs tens of seconds to refresh its coins,
+   * so a fixed multiple of DATA_REFRESH_MS would mark fresh data stale and freeze every bee. The tolerance is
+   * therefore at least three data cycles OR two full refresh durations plus one cycle, whichever is larger.
+   */
+  private maxDataAge(cfg: Config): number {
+    const cycles = 3 * cfg.dataRefreshMs + 30_000;
+    const byDuration = 2 * this.d.feed.lastRefreshDurationMs + cfg.dataRefreshMs + 30_000;
+    return Math.max(cycles, byDuration);
+  }
 
   /** MODE=dry: charge funding at 00/08/16 UTC using the current rate (long pays a positive rate). */
   private simulateFunding(now: number) {

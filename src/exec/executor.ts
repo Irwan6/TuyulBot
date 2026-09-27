@@ -32,7 +32,11 @@ export interface FundingBill {
 }
 
 export interface Executor {
-  readonly kind: "sim" | "okx";
+  /**
+   * `hyperliquid` is a signed venue like `okx`; `sim` is the paper one. The engine branches on this for
+   * reconciliation and funding polling, so any new signed venue must be added to those checks in engine.ts.
+   */
+  readonly kind: "sim" | "okx" | "hyperliquid";
   init(bee: BeeId): Promise<void>;
   market(bee: BeeId, req: OrderReq): Promise<OrderResult>;
   positions(bee: BeeId): Promise<ExchangePosition[] | null>;

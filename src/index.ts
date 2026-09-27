@@ -2,20 +2,20 @@ import { existsSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Alerts } from "./alerts.js";
 import { BREEZY_COINS } from "./bees/breezy.js";
-import { BEES, ConfigError, loadConfig, STYLES, type Config } from "./config.js";
+import { BEES, ConfigError, loadConfig, STYLES, type BeeId, type Config } from "./config.js";
 import { Db } from "./db.js";
 import { Engine } from "./engine.js";
 import { EventBus } from "./events.js";
 import { hashPassword, MIN_PASSWORD } from "./gate.js";
 import { Hive, hivePath } from "./hive.js";
 import { OkxExecutor, SimExecutor, type Executor } from "./exec/executor.js";
+import { HyperliquidExecutor } from "./exec/hyperliquid.js";
 import { Jev } from "./jev.js";
 import { log, setLogLevel } from "./log.js";
 import { MarketFeed } from "./market/data.js";
+import { createVenueFeed } from "./market/venue.js";
 import { createOkxCli } from "./okx/cli.js";
 import { createNewsSource } from "./okx/news.js";
-import { createPublicApi } from "./okx/public.js";
-import { createOkxPublicRest } from "./okx/rest.js";
 import { safeError } from "./redact.js";
 import { startServer } from "./server.js";
 import { loadSettings, STYLE_INFO } from "./settings.js";
@@ -93,9 +93,18 @@ async function main() {
   const bus = new EventBus(db);
   const alerts = new Alerts(cfg.alertWebhookUrl);
   const cli = createOkxCli({ site: cfg.okx.site, timeoutMs: cfg.okx.cliTimeoutMs });
-  // Public market data runs in-process on the kit's REST client; the CLI (one child process per call) is kept for
-  // the signed per-bee calls only.
-  const api = createPublicApi(cfg.okx.apiBase, cfg.mode === "demo", createOkxPublicRest({ apiBase: cfg.okx.apiBase, timeoutMs: cfg.okx.cliTimeoutMs }));
+  // Public market data runs in-process: the OKX kit's REST client, or the Hyperliquid /info API (VENUE).
+  const venue = createVenueFeed({
+    venue: cfg.venue,
+    okxApiBase: cfg.okx.apiBase,
+    hlMainnetApiBase: cfg.hl.mainnetApiBase,
+    hlTestnetApiBase: cfg.hl.testnetApiBase,
+    demo: cfg.mode === "demo",
+    timeoutMs: cfg.okx.cliTimeoutMs,
+    weightBudgetPerMin: cfg.hl.weightBudgetPerMin,
+  });
+  const api = venue.api;
+  log.info("market venue", { venue: venue.label, fundingPerDay: venue.fundingPerDay });
   const demo = cfg.mode === "demo";
 
   let engine: Engine | null = null;
@@ -110,6 +119,9 @@ async function main() {
       allowNonCrypto: cfg.universe.allowNonCrypto,
       spreadGateBps: Math.max(...STYLES.map((s) => cfg.bees[s].spreadGateBps)),
       trendCoins: [...BREEZY_COINS],
+      venueFilter: venue.venueFilter,
+      fundingPerDay: venue.fundingPerDay,
+      maxStatCoins: cfg.maxStatCoins,
     },
     news,
     held,
@@ -118,7 +130,18 @@ async function main() {
   const exec: Executor =
     cfg.mode === "dry"
       ? new SimExecutor(() => feed.view(), cfg.risk.takerFeeRate)
-      : new OkxExecutor(cli, cfg.creds, demo, (id) => feed.view().instruments.get(id), cfg.risk.maxLeverage);
+      : cfg.venue === "hyperliquid"
+        ? new HyperliquidExecutor({
+            agentKeys: Object.fromEntries(Object.entries(cfg.hlCreds).map(([b, c]) => [b, c!.agentKey])) as Partial<Record<BeeId, `0x${string}`>>,
+            accounts: Object.fromEntries(Object.entries(cfg.hlCreds).map(([b, c]) => [b, c!.account])) as Partial<Record<BeeId, `0x${string}`>>,
+            testnet: demo,
+            leverage: cfg.risk.maxLeverage,
+            slippageBps: cfg.hlSlippageBps,
+            takerFeeRate: cfg.risk.takerFeeRate,
+            instrument: (id) => feed.view().instruments.get(id),
+            midFor: (id) => feed.view().tickers.get(id)?.mid,
+          })
+        : new OkxExecutor(cli, cfg.creds, demo, (id) => feed.view().instruments.get(id), cfg.risk.maxLeverage);
 
   const startOfDay = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
   const jev = new Jev({ ...cfg.jev, spentTodayUsd: db.jevSpendSince(startOfDay) });

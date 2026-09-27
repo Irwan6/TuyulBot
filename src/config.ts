@@ -77,6 +77,52 @@ const EnvSchema = z.object({
   OKX_API_BASE: str("https://eea.okx.com"),
   OKX_CLI_TIMEOUT_MS: num(15_000),
 
+  /**
+   * Which exchange the engine reads market data from and trades on.
+   *
+   * - `okx` (default): OKX EEA X-Perps. Unchanged behaviour.
+   * - `hyperliquid`: Hyperliquid perps. Reachable from networks that DNS-block the OKX/Bybit/Binance domains,
+   *   and trades through an EVM agent wallet instead of API keys (see src/hyperliquid/).
+   *
+   * Only the market-data path and the venue filter follow this today; the signed executor is still OKX-only, so
+   * VENUE=hyperliquid runs in MODE=dry (paper) until a Hyperliquid executor exists. MODE=demo/live with
+   * VENUE=hyperliquid is refused at startup rather than silently trading the wrong venue.
+   */
+  VENUE: z.enum(["okx", "hyperliquid"]).optional().default("okx"),
+  /** Hyperliquid public REST base. Defaults to mainnet; the testnet base is used automatically in MODE=demo. */
+  HL_API_BASE: str("https://api.hyperliquid.xyz"),
+  HL_TESTNET_API_BASE: str("https://api.hyperliquid-testnet.xyz"),
+  /**
+   * Hyperliquid /info weight budget per minute. The documented limit is 1200 per IP; the adapter keeps headroom
+   * under it. Lower it if another process on the same IP also calls Hyperliquid.
+   */
+  HL_WEIGHT_BUDGET_PER_MIN: num(1200),
+  /**
+   * Hyperliquid per-bee credentials. Two addresses per bee, on purpose:
+   *
+   * - BEE<n>_HL_AGENT_KEY: the AGENT (API) wallet private key that signs orders. Hyperliquid will not let an
+   *   agent withdraw or transfer, so this key can trade but cannot move funds out. Never your main wallet key.
+   * - BEE<n>_HL_ACCOUNT: the main wallet address whose positions are read (the agent signs on its behalf).
+   *
+   * Approve the agent once from the Hyperliquid UI; see README.
+   */
+  BEE1_HL_AGENT_KEY: opt,
+  BEE1_HL_ACCOUNT: opt,
+  BEE2_HL_AGENT_KEY: opt,
+  BEE2_HL_ACCOUNT: opt,
+  BEE3_HL_AGENT_KEY: opt,
+  BEE3_HL_ACCOUNT: opt,
+  /** Slippage bound (bps) for Hyperliquid's aggressive-IOC "market" order. */
+  HL_SLIPPAGE_BPS: num(50),
+  /**
+   * How many of the gated coins get full stats per refresh. Only matters on venues that charge per call
+   * (Hyperliquid). The bees read the top of the volume-sorted list, so this costs them nothing.
+   *
+   * The default is sized to the Hyperliquid weight budget: each coin costs ~48 weight (100x15m + 200x1h
+   * candles, plus its order book) against 1200/minute, so ~20 coins is what one refresh per minute can sustain.
+   */
+  MAX_STAT_COINS: num(20),
+
   BEE_START_EQUITY_USD: num(333),
   MAX_LEVERAGE: num(2),
   MARGIN_MODE: z.literal("isolated").optional().default("isolated"),
@@ -182,6 +228,18 @@ export interface Config {
     takerFeeRate: number;
   };
   universe: { min24hVolUsd: number; allowNonCrypto: boolean };
+  /** Which venue the market feed reads (and, once its executor exists, trades on). */
+  venue: "okx" | "hyperliquid";
+  /** Hyperliquid public REST bases. */
+  hl: { mainnetApiBase: string; testnetApiBase: string; weightBudgetPerMin: number };
+  /**
+   * Hyperliquid per-bee signing credentials. `agentKey` signs orders and cannot withdraw; `account` is the main
+   * wallet whose positions are read. Never logged; only the derived agent ADDRESS is ever shown.
+   */
+  hlCreds: Partial<Record<BeeId, { agentKey: `0x${string}`; account: `0x${string}` }>>;
+  hlSlippageBps: number;
+  /** Cap on coins that get full stats per refresh (see FeedOpts.maxStatCoins). */
+  maxStatCoins: number;
   /** Knobs per trading style. */
   bees: Record<StyleId, BeeKnobs>;
   breezy: { minOpenProb: number; minSizeUsd: number };
@@ -216,7 +274,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
 
   if (e.MAX_LEVERAGE > 2 || e.MAX_LEVERAGE <= 0) throw new ConfigError("MAX_LEVERAGE must be in (0, 2]. Hard rule 3.");
   if (e.MAX_FLAT_MINUTES < 0) throw new ConfigError("MAX_FLAT_MINUTES must be >= 0");
-
+  // VENUE=hyperliquid on a signed mode needs that venue's own credentials: an OKX key would be silently useless.
+  const needsHl = e.VENUE === "hyperliquid" && !e.DRY_RUN;
+  if (needsHl) {
+    const missingHl = BEES.flatMap((bee) => {
+      const p = bee.toUpperCase();
+      return [`${p}_HL_AGENT_KEY`, `${p}_HL_ACCOUNT`].filter((k) => !e[k]);
+    });
+    if (missingHl.length) {
+      throw new ConfigError(`VENUE=hyperliquid with MODE=${e.MODE} needs an agent wallet per bee:\n  ${missingHl.join("\n  ")}\nEach needs BEE<n>_HL_AGENT_KEY (an approved API wallet that cannot withdraw) and BEE<n>_HL_ACCOUNT (the main wallet address).`);
+    }
+  }
   const slots = {} as Record<BeeId, SlotProfile>;
   BEES.forEach((id, i) => {
     const b = settings?.bees[i];
@@ -227,7 +295,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
   });
 
   const creds: Partial<Record<BeeId, OkxCreds>> = {};
-  if (mode !== "dry") {
+  // Only OKX needs OKX keys: with VENUE=hyperliquid the signed executor signs with an EVM agent key instead,
+  // and demanding OKX keys there would block a perfectly valid Hyperliquid install.
+  if (mode !== "dry" && !needsHl) {
     const infix = mode === "demo" ? "OKX_DEMO_API" : "OKX_API";
     for (const bee of BEES) {
       const p = bee.toUpperCase();
@@ -242,6 +312,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
   }
   if (missing.length) {
     throw new ConfigError(`MODE=${mode} needs these settings, which are blank or missing:\n  ${missing.join("\n  ")}`);
+  }
+
+  const hlCreds: Partial<Record<BeeId, { agentKey: `0x${string}`; account: `0x${string}` }>> = {};
+  if (needsHl) {
+    for (const bee of BEES) {
+      const p = bee.toUpperCase();
+      const k = e[`${p}_HL_AGENT_KEY`] as string | undefined;
+      const a = e[`${p}_HL_ACCOUNT`] as string | undefined;
+      if (k && a) hlCreds[bee] = { agentKey: k as `0x${string}`, account: a as `0x${string}` };
+    }
   }
 
   const knobs = (style: StyleId): BeeKnobs => {
@@ -287,6 +367,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
       takerFeeRate: e.TAKER_FEE_RATE,
     },
     universe: { min24hVolUsd: e.MIN_24H_VOL_USD, allowNonCrypto: e.ALLOW_NON_CRYPTO },
+    venue: e.VENUE,
+    hl: { mainnetApiBase: e.HL_API_BASE.replace(/\/+$/, ""), testnetApiBase: e.HL_TESTNET_API_BASE.replace(/\/+$/, ""), weightBudgetPerMin: e.HL_WEIGHT_BUDGET_PER_MIN },
+    hlCreds,
+    hlSlippageBps: e.HL_SLIPPAGE_BPS,
+    maxStatCoins: Math.max(1, e.MAX_STAT_COINS),
     bees: { bizzy: knobs("bizzy"), breezy: knobs("breezy"), boozy: knobs("boozy") },
     breezy: { minOpenProb: e.BREEZY_MIN_OPEN_PROB, minSizeUsd: e.BREEZY_MIN_SIZE_USD },
     bizzy: { sizeFraction: e.BIZZY_SIZE_FRACTION, universeSize: e.BIZZY_UNIVERSE_SIZE, timeStopMinutes: e.BIZZY_TIME_STOP_MINUTES },

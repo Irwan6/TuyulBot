@@ -214,8 +214,67 @@ pnpm snapshot        # each style's menu and snapshot from live data (no Jev cal
 pnpm e2e:fake-jev    # the whole engine on paper with a random fake Jev (no spend)
 pnpm dev             # the real engine on paper, with real Jev calls (Setup runs if there is no key)
 
+# Hyperliquid venue (VENUE=hyperliquid): same engine, different exchange
+VENUE=hyperliquid pnpm venue:gate    # what the gate would trade right now, from live public data (no keys)
+VENUE=hyperliquid pnpm e2e:hl        # the whole engine on Hyperliquid paper data, fake Jev (no spend, no wallet)
+VENUE=hyperliquid MODE=demo pnpm hl:roundtrip   # one round trip per bee on testnet (needs an agent wallet)
+
 cd dashboard && pnpm install && pnpm dev    # http://127.0.0.1:5173, proxied to the engine
 ```
+
+### Venue: OKX EEA or Hyperliquid
+
+The engine reads market data from one venue at a time, chosen with `VENUE` (`okx` by default, `hyperliquid` for
+Hyperliquid perps). Everything else — the risk layer, the ledger, the dashboard, the three styles — is unchanged.
+
+`VENUE=hyperliquid` exists mainly because some networks cannot reach the OKX domains at all: several ISPs (XL
+Axiata in Indonesia, for one) resolve `eea.okx.com`, `api.bybit.com` and `fapi.binance.com` to a blockpage while
+`api.hyperliquid.xyz` answers normally. Switching DNS to `1.1.1.1` works around a DNS-level block, but a venue that
+is simply reachable is less to go wrong.
+
+What differs, and why it matters if you are reading the market layer:
+
+| | OKX EEA | Hyperliquid |
+|---|---|---|
+| universe | ~29 X-Perps | ~178 perps (86 pass the default gates) |
+| funding | every 8 h | **every hour** (normalised to an 8 h rate before the bees see it) |
+| instrument ids | `BTC-USDT-SWAP`-shaped | bare coin names (`BTC`) |
+| contract size | `ctVal` + `lotSz` | 1 contract = 1 coin, `szDecimals` |
+| 24 h volume | base volume x price | `dayNtlVlm`, already USD |
+| open interest | already USD | in coins, x mark price |
+| spread | in the ticker response | one `l2Book` request **per coin** |
+| rate limit | per endpoint | **1200 weight/minute per IP**, charged by payload size |
+
+That last row is the one to respect: a full refresh of 86 coins costs ~4100 weight, so the feed caps the coins it
+computes stats for (`MAX_STAT_COINS`, default 20 — the bees only read the top of the volume-sorted list anyway),
+quotes order books on the slow refresh cadence rather than every tick, and paces every call through a weight
+limiter.
+
+#### Trading on Hyperliquid (signed orders)
+
+Hyperliquid has no API key and secret. Orders are signed with an EVM **agent (API) wallet** (EIP-712), approved
+once from your main wallet in the Hyperliquid UI. Set, per bee:
+
+| setting | what it is |
+|---|---|
+| `BEE<n>_HL_AGENT_KEY` | the agent wallet's private key. It can trade and **cannot withdraw or transfer** |
+| `BEE<n>_HL_ACCOUNT` | your main wallet's **address**, whose positions and funding are read |
+
+Your main wallet's private key is never needed and never asked for: it stays in your wallet app. The agent key
+is the only secret beebots holds, and a leaked one cannot move funds out of the account.
+
+With `MODE=demo` the engine talks to the Hyperliquid **testnet** automatically, and the same three keys work
+there after approving the agent on testnet too. `pnpm hl:roundtrip` runs one real round trip per bee there —
+open, read the position back from the venue, close, and reconcile the real fee — before anything touches real
+money.
+
+Two venue limits shape what can be traded: every order must be worth at least **$10**, and each coin's price
+precision (`szDecimals`) sets the smallest size it can accept. A coin whose minimum lot is worth more than $10
+cannot be traded at all (at the time of writing that is ZEC, at ~$16.55 a lot). The executor refuses both cases
+with a clear `MIN_NOTIONAL` / `SIZE` code rather than passing them to the venue.
+
+Hyperliquid has no market order type: a "market" order is an IOC limit priced through the touch by
+`HL_SLIPPAGE_BPS` (default 50), which is what Hyperliquid's own frontend does.
 
 Build the images yourself instead of pulling them:
 

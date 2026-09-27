@@ -1,5 +1,5 @@
 import { log } from "../log.js";
-import type { PublicApi } from "../okx/public.js";
+import type { PublicApi } from "./public-api.js";
 import { safeError } from "../redact.js";
 import { atr, bollinger, macd, pctChange, rsi, trendStats, zScore } from "./indicators.js";
 import type { Candle, CoinStats, Instrument, MarketView, Ticker } from "./types.js";
@@ -22,9 +22,28 @@ export interface FeedOpts {
   spreadGateBps: number;
   /** Coins that always get stats + 4h trend data (breezy's majors). */
   trendCoins: string[];
+  /** Which instIds this venue lists. Defaults to OKX EEA X-Perps (market/universe.ts). */
+  venueFilter?: (instId: string) => boolean;
+  /**
+   * Settlements per day on this venue (OKX 3, Hyperliquid 24). Used to normalise the funding rate the bees and
+   * the risk layer see, so an hourly rate is never compared against a threshold calibrated on 8-hourly rates.
+   */
+  fundingPerDay?: number;
+  /**
+   * How many of the gated coins get full stats (candles, indicators, funding, OI) per refresh.
+   *
+   * The gate is cheap (one snapshot covers every coin) but stats are not: each coin costs several candle calls,
+   * and Hyperliquid charges a weight-based budget of 1200/min per IP. All 85 gated coins would need ~4100 weight
+   * per refresh, so the feed would spend its whole minute on one cycle. The bees only ever look at the top of
+   * the volume-sorted list (bizzy ~8, boozy 5 candidates, breezy 2 majors), so capping here costs them nothing.
+   * `gated` itself stays complete, so the dashboard still reports the true universe size.
+   */
+  maxStatCoins?: number;
 }
 
 const HOUR = 3_600_000;
+/** OKX EEA X-Perps settle funding every 8h; every funding threshold in the repo is calibrated on that. */
+const FUNDING_PER_DAY_OKX = 3;
 
 export function computeStats(inst: Instrument, t: Ticker, c15: Candle[], c1h: Candle[]): CoinStats {
   const closes15 = c15.map((c) => c.c);
@@ -74,7 +93,17 @@ export class MarketFeed {
   private fundingHist = new Map<string, { at: number; rates: number[] }>();
   private instrumentsAt = 0;
   private newsAvailable = false;
+  /** Settlements per day on this venue; the funding normaliser in `refresh`. */
+  private fundingPerDay: number;
   lastRefreshAt = 0;
+  /**
+   * How long the last full refresh actually took.
+   *
+   * On a venue that charges a weight budget per minute (Hyperliquid) a refresh of N coins legitimately takes
+   * tens of seconds, so a staleness threshold derived only from DATA_REFRESH_MS would declare fresh data stale
+   * and freeze every bee. The engine scales its tolerance by this instead (see Engine.maxDataAge).
+   */
+  lastRefreshDurationMs = 0;
 
   constructor(
     private api: PublicApi,
@@ -82,7 +111,9 @@ export class MarketFeed {
     private news: NewsSource | null,
     /** Coins currently held by any bee: they keep getting stats even if they drop out of the gate. */
     private heldInstIds: () => string[],
-  ) {}
+  ) {
+    this.fundingPerDay = opts.fundingPerDay && opts.fundingPerDay > 0 ? opts.fundingPerDay : FUNDING_PER_DAY_OKX;
+  }
 
   view(): MarketView {
     return {
@@ -101,7 +132,7 @@ export class MarketFeed {
     return undefined;
   }
 
-  /** Every tick: one CLI call re-reads all tickers, so mark prices and spreads stay live. */
+  /** Every tick: re-read mark prices and volume. Cheap: one batched snapshot on every venue. */
   async refreshTickers(): Promise<void> {
     this.tickers = await this.api.tickers();
     for (const s of this.stats.values()) {
@@ -116,19 +147,47 @@ export class MarketFeed {
     }
   }
 
+  /**
+   * Re-measure spreads for the coins that matter.
+   *
+   * On OKX this is a no-op: its single tickers call already carries bid/ask for every instrument. On a venue
+   * that charges one request per order book (Hyperliquid), doing this every tick would cost several times the
+   * whole per-minute weight budget, so the feed calls it on the slow data-refresh cadence instead. Until the
+   * first call lands, spreadBp is Infinity and the spread gate correctly holds every coin.
+   */
+  async refreshSpreads(): Promise<void> {
+    if (!this.api.refreshSpreads) return;
+    const coins = [...new Set([...this.gated, ...this.heldInstIds()])];
+    await this.api.refreshSpreads(coins);
+  }
+
   /** Every DATA_REFRESH_MS: universe gates, candles, indicators, funding, OI, news. */
   async refresh(now = Date.now()): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      await this.refreshInner(now);
+    } finally {
+      // Recorded even on failure: a refresh that dies still took time, and the engine's staleness tolerance
+      // must not shrink back to a value this venue cannot meet.
+      this.lastRefreshDurationMs = Date.now() - startedAt;
+    }
+  }
+
+  private async refreshInner(now: number): Promise<void> {
     if (now - this.instrumentsAt > HOUR || this.instruments.size === 0) {
       const list = await this.api.instruments();
       this.instruments = new Map(list.map((i) => [i.instId, i]));
       this.instrumentsAt = now;
     }
+    // Spreads first: they are what the gate below measures, and on a per-book venue this is the expensive part.
+    await this.refreshSpreads();
     const [tickers, oi] = await Promise.all([this.api.tickers(), this.api.openInterest()]);
     this.tickers = tickers;
     const u = gateUniverse(this.instruments.values(), tickers, {
       min24hVolUsd: this.opts.min24hVolUsd,
       spreadGateBps: this.opts.spreadGateBps,
       allowNonCrypto: this.opts.allowNonCrypto,
+      venueFilter: this.opts.venueFilter,
     });
     this.gated = u.tradable;
     this.spreadBlocked = u.spreadBlocked;
@@ -141,7 +200,10 @@ export class MarketFeed {
     }
 
     const trendIds = this.opts.trendCoins.map((c) => this.instIdForCoin(c)).filter((x): x is string => !!x);
-    const want = [...new Set([...this.gated, ...trendIds, ...this.heldInstIds()])].filter((id) => this.instruments.has(id) && tickers.has(id));
+    // `gated` is volume-sorted, so the cap keeps the most liquid coins. Held positions and trend coins are
+    // always included whatever their rank, so a bee never loses sight of a position it already has.
+    const capped = this.opts.maxStatCoins && this.opts.maxStatCoins > 0 ? this.gated.slice(0, this.opts.maxStatCoins) : this.gated;
+    const want = [...new Set([...capped, ...trendIds, ...this.heldInstIds()])].filter((id) => this.instruments.has(id) && tickers.has(id));
 
     const next = new Map<string, CoinStats>();
     await Promise.all(
@@ -158,7 +220,13 @@ export class MarketFeed {
           ]);
           const s = computeStats(inst, tickers.get(id)!, c15, c1h);
           if (funding && Number.isFinite(funding.rate)) {
-            s.fundingPct = funding.rate * 100;
+            // Normalise to an 8-hour rate, the unit every threshold in this repo was calibrated on (OKX EEA
+            // settles 3x/day). Hyperliquid settles hourly, so its raw rate is 1/8 of an 8h rate: without this
+            // scaling the engine's 3x/day funding charge would collect only a third of what it should, and
+            // `fundingPct` would not be comparable between venues. OKX (perDay = 3) is unchanged.
+            s.fundingPct = funding.rate * 100 * (this.fundingPerDay / FUNDING_PER_DAY_OKX);
+            // fundingZ stays the venue's own z-score: it measures how unusual this rate is *for this coin on
+            // this venue*, so rescaling it would distort the comparison it is meant to make.
             s.fundingZ = fHist.length ? zScore(funding.rate, fHist) : null;
           }
           s.oiUsd = oi.get(id) ?? null;
@@ -189,7 +257,9 @@ export class MarketFeed {
     }
 
     this.stats = next;
-    this.lastRefreshAt = now;
+    // Stamp the completion time, not the start: everything above is what makes the stats valid, and a slow
+    // venue must not be judged stale by the clock it started on.
+    this.lastRefreshAt = Date.now();
   }
 
   private oiChange1h(id: string, now: number): number | null {

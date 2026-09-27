@@ -13,15 +13,25 @@ export interface GateOpts {
   min24hVolUsd: number;
   spreadGateBps: number;
   allowNonCrypto: boolean;
+  /**
+   * Only coins this venue lists may trade. Defaults to the OKX EEA X-Perp suffix so existing behaviour (and
+   * every test written against it) is unchanged; Hyperliquid passes a plain-set predicate because its instIds
+   * are bare coin names ("BTC"), not "BTC-USDT-SWAP"-shaped.
+   */
+  venueFilter?: (instId: string) => boolean;
 }
 
-/** Hard rule 5: discover, never hard-code. Live, X-Perp, not TEST*, crypto unless allowed, volume and spread gates. */
+/** OKX EEA lists X-Perps only, and their instIds carry this marker. */
+const okxXperp = (instId: string) => instId.includes("_UM_XPERP-");
+
+/** Hard rule 5: discover, never hard-code. Live, venue-listed, not TEST*, crypto unless allowed, volume and spread gates. */
 export function gateUniverse(instruments: Iterable<Instrument>, tickers: Map<string, Ticker>, g: GateOpts): UniverseResult {
+  const onVenue = g.venueFilter ?? okxXperp;
   const tradable: Array<[string, number]> = [];
   const spreadBlocked: string[] = [];
   const unknown: string[] = [];
   for (const i of instruments) {
-    if (i.state !== "live" || !i.instId.includes("_UM_XPERP-") || i.coin.startsWith("TEST")) continue;
+    if (i.state !== "live" || !onVenue(i.instId) || i.coin.startsWith("TEST")) continue;
     if (i.kind === "unknown") {
       unknown.push(i.instId);
       continue;

@@ -1,5 +1,6 @@
 import { kindOf } from "../market/kinds.js";
-import type { Candle, FundingNow, Instrument, Ticker } from "../market/types.js";
+import type { PublicApi } from "../market/public-api.js";
+import type { Candle, Instrument, Ticker } from "../market/types.js";
 import { createOkxPublicRest, type OkxPublicRest } from "./rest.js";
 
 const XPERP = "_UM_XPERP-";
@@ -7,14 +8,11 @@ const num = (v: unknown) => (v === undefined || v === null || v === "" ? NaN : N
 
 type Row = Record<string, string>;
 
-export interface PublicApi {
-  instruments(): Promise<Instrument[]>;
-  tickers(): Promise<Map<string, Ticker>>;
-  candles(instId: string, bar: "15m" | "1H" | "4H", limit: number): Promise<Candle[]>;
-  openInterest(): Promise<Map<string, number>>;
-  funding(instId: string): Promise<FundingNow>;
-  fundingHistory(instId: string, limit: number): Promise<number[]>;
-}
+/** OKX settles funding every 8h, and `fundingHistory` returns one sample per settlement. */
+export const OKX_FUNDING = { perDay: 3, intervalHours: 8 } as const;
+
+// The contract lives in market/public-api.ts so the market layer never imports an exchange adapter.
+export type { PublicApi } from "../market/public-api.js";
 
 export function parseInstrument(r: Row): Instrument {
   const coin = r.instId!.split("-")[0]!;

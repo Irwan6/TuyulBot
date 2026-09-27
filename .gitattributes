@@ -1,0 +1,19 @@
+# Keep line endings out of the diff.
+#
+# This repo is edited from both Windows and Linux. Without this file, a Windows checkout with
+# core.autocrlf=true rewrites every LF to CRLF, so `git status` reports the whole tree as modified and
+# real changes are impossible to spot. `text=auto` stores LF in the repository and checks out whatever
+# the platform wants, so a diff only ever shows a real edit.
+* text=auto
+
+# Images are binary: never touch their bytes.
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# A lockfile is generated; keep it out of review noise.
+pnpm-lock.yaml -diff

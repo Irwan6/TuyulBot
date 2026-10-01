@@ -35,7 +35,8 @@
     "demo:close": "tsx --env-file-if-exists=.env src/tools/demo-close.ts",
     "hl:roundtrip": "tsx --env-file-if-exists=.env src/tools/hl-roundtrip.ts",
     "hl:account": "tsx --env-file-if-exists=.env src/tools/hl-account.ts",
-    "hl:arb": "tsx src/tools/hl-arb.ts"
+    "hl:arb": "tsx src/tools/hl-arb.ts",
+    "hl:signcheck": "tsx --env-file-if-exists=.env src/tools/hl-signcheck.ts"
   },
   "dependencies": {
     "@nktkas/hyperliquid": "^0.33.3",

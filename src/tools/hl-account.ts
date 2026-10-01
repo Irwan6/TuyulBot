@@ -74,9 +74,27 @@ for (const { label, address } of targets) {
 
       // An agent address is a signer, not an account: reading positions from it returns empty forever.
       if (role.role === "agent") {
-        const actsFor = (role.data as { user: string }).user;
+        const actsFor = (role.data as { user: string }).user as `0x${string}`;
         console.log(`   ✗ THIS IS AN AGENT (API) WALLET, not an account. It signs for ${actsFor}.`);
         console.log(`     Use ${actsFor} as BEE<n>_HL_ACCOUNT, and this address only as BEE<n>_HL_AGENT_KEY.`);
+        // Read the account it acts for, so the account's own state is visible from here too — that is
+        // usually the next question ("so does the account have funds?").
+        try {
+          const acctSt = await info.clearinghouseState({ user: actsFor });
+          const acctSpot = await info.spotClearinghouseState({ user: actsFor });
+          const acctUsdc = acctSpot.balances.find((b) => b.coin === "USDC");
+          console.log(`     that account: $${Number(acctSt.marginSummary.accountValue).toFixed(2)} perp equity, ${acctUsdc ? Number(acctUsdc.total).toFixed(2) : "0"} USDC spot`);
+          const ag = (await info.extraAgents({ user: actsFor })) as unknown as Array<{ address?: string; name?: string; validUntil?: number }>;
+          const self = ag.find((a) => a.address?.toLowerCase() === address.toLowerCase());
+          if (self) {
+            const days = self.validUntil ? Math.round((self.validUntil - Date.now()) / 86_400_000) : null;
+            console.log(`     registered as ${self.name ? `"${self.name}"` : "(unnamed)"}${days !== null ? ` · expires in ${days} day(s)` : ""}`);
+          } else {
+            console.log(`     not in extraAgents: either unnamed (still valid) or NOT approved for this account`);
+          }
+        } catch {
+          /* advisory only */
+        }
         problems++;
         continue;
       }

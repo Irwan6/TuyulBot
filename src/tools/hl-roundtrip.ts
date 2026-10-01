@@ -106,8 +106,22 @@ for (const bee of BEES) {
       const role = await info.userRole({ user: agent.address });
       const actsFor = role.role === "agent" ? (role.data as { user: string }).user.toLowerCase() : "";
       const matches = actsFor === accounts[bee]!.toLowerCase();
-      ok(matches, matches ? `agent is approved for ${accounts[bee]}` : `agent is NOT approved for this account (userRole = ${JSON.stringify(role).slice(0, 120)})`);
-      if (!matches) continue;
+      if (!matches) {
+        // Distinguish the two failures, because the fixes are different: an address pasted where the private
+        // key belongs looks identical to an unapproved agent until you check which address this key derives to.
+        if (role.role === "missing") {
+          ok(false, `this private key derives to ${agent.address}, which Hyperliquid has never seen on this network`);
+          console.log(`     Either the key is from the other network (mainnet vs testnet), or it was never authorized.`);
+        } else if (role.role === "user") {
+          ok(false, `this private key derives to ${agent.address}, which is an ordinary ACCOUNT, not an agent`);
+          console.log(`     That is a wallet's own key, not an API wallet's. Use the key shown by Generate Wallet Address on /API.`);
+        } else {
+          ok(false, `agent ${agent.address} is not approved for ${accounts[bee]} (userRole = ${JSON.stringify(role).slice(0, 120)})`);
+          console.log(`     Approve it on /API, or set BEE<n>_HL_ACCOUNT to the account it does sign for.`);
+        }
+        continue;
+      }
+      ok(true, `agent is approved for ${accounts[bee]}`);
 
       const agents = (await info.extraAgents({ user: accounts[bee]! })) as unknown as Array<{ address?: string; name?: string; validUntil?: number }>;
       const named = agents.find((a) => a.address?.toLowerCase() === agent.address.toLowerCase());

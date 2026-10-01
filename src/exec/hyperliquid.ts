@@ -106,6 +106,16 @@ export class HyperliquidExecutor implements Executor {
     this.info = new InfoClient({ transport: this.transport });
     for (const [bee, key] of Object.entries(o.agentKeys) as Array<[BeeId, `0x${string}`]>) {
       if (!key) continue;
+      // An address pasted where the private key belongs is the most common mistake, and viem's error for it
+      // ("expected hex or 32 bytes") never says so. Name the problem at the point where it is knowable.
+      if (/^0x[0-9a-fA-F]{40}$/.test(key)) {
+        throw new Error(
+          `${bee}: BEE<n>_HL_AGENT_KEY looks like an ADDRESS (0x + 40 hex), not a private key (0x + 64 hex).\n` +
+            `  ${key} is the API wallet's public address. The private key was shown once by "Generate Wallet\n` +
+            `  Address" on app.hyperliquid.xyz/API and cannot be displayed again — revoke this agent and create\n` +
+            `  a new one if it was not saved.`,
+        );
+      }
       const account = privateKeyToAccount(key);
       this.agentAddr.set(bee, account.address);
       this.exch.set(bee, new ExchangeClient({ wallet: account, transport: this.transport }));
